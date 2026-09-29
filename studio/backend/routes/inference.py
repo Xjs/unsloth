@@ -3628,6 +3628,7 @@ from core.inference.anthropic_compat import (
     build_anthropic_sse_event,
     AnthropicStreamEmitter,
     AnthropicPassthroughEmitter,
+    anthropic_prompt_cache_split,
 )
 from auth import policy as auth_policy, storage as auth_storage
 from auth.authentication import (
@@ -37703,6 +37704,7 @@ def _anthropic_message_json_response(
 ) -> Response:
     """Assemble the terminal Anthropic non-streaming JSON response shared by the
     tool / plain / passthrough paths."""
+    uncached, cached = anthropic_prompt_cache_split(usage)
     return _model_json_response(
         AnthropicMessagesResponse(
             id = message_id,
@@ -37710,7 +37712,8 @@ def _anthropic_message_json_response(
             content = content_blocks,
             stop_reason = stop_reason,
             usage = AnthropicUsage(
-                input_tokens = usage.get("prompt_tokens", 0),
+                input_tokens = uncached,
+                cache_read_input_tokens = cached,
                 output_tokens = usage.get("completion_tokens", 0),
             ),
         )

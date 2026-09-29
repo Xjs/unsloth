@@ -510,15 +510,59 @@ def build_anthropic_sse_event(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
-def _message_delta_usage(usage: Optional[dict]) -> dict:
-    """Usage block for a message_delta event (cumulative token counts). Cache
-    fields are always 0 — no prompt caching backend. ``usage`` may be None when a
-    metadata event carried usage=None (e.g. only finish_reason set)."""
+def anthropic_prompt_cache_split(usage: Optional[dict]) -> tuple:
+    """Split a prompt's token count into ``(uncached, cached)``.
+
+    llama-server reports a KV-cache prefix hit two ways -- ``timings.cache_n``
+    and the OpenAI-shaped ``usage.prompt_tokens_details.cached_tokens``. Only
+    the second one travels inside ``usage``, which is all this layer is handed,
+    so that is the one to read.
+
+    The split mirrors llama-server's own Anthropic serializer
+    (``tools/server/server-task.cpp``: ``cache_read_input_tokens =
+    n_prompt_tokens_cache``, ``input_tokens = n_prompt_tokens -
+    n_prompt_tokens_cache``) so both front ends agree field for field. The total
+    is preserved, which matters because clients size the context window from
+    ``input + cache_creation + cache_read``.
+    """
     usage = usage or {}
+    try:
+        prompt = int(usage.get("prompt_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+    cached = 0
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        try:
+            cached = int(details.get("cached_tokens") or 0)
+        except (TypeError, ValueError):
+            cached = 0
+    # A reused prefix cannot exceed the prompt it was reused for. Clamp instead
+    # of emitting a negative input_tokens if a backend contradicts itself.
+    cached = max(0, min(cached, max(prompt, 0)))
+    return prompt - cached, cached
+
+
+def _message_delta_usage(usage: Optional[dict]) -> dict:
+    """Usage block for a message_delta event (cumulative token counts).
+
+    ``usage`` may be None when a metadata event carried usage=None (e.g. only
+    finish_reason set).
+
+    ``cache_read_input_tokens`` reports llama-server's reused prefix. Sending it
+    here rather than in message_start is deliberate: the hit is only known once
+    the prompt has been processed, whereas message_start goes out before the
+    prefill. Anthropic clients merge usage fields from message_delta over the
+    message_start snapshot, so the late report still lands.
+    ``cache_creation_input_tokens`` stays 0 -- llama-server's own Anthropic
+    serializer omits it, and there is no separate cache-write cost to report.
+    """
+    usage = usage or {}
+    uncached, cached = anthropic_prompt_cache_split(usage)
     return {
-        "input_tokens": usage.get("prompt_tokens", 0),
+        "input_tokens": uncached,
         "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
+        "cache_read_input_tokens": cached,
         "output_tokens": usage.get("completion_tokens", 0),
     }
 
