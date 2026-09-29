@@ -3833,13 +3833,49 @@ class AnthropicMessagesRequest(BaseModel):
         retained_system = [_anthropic_content_to_system_text(data.get("system"))]
         changed = False
 
-        for message in messages:
+        # WHERE a system message sits decides whether hoisting it is free.
+        #
+        # Before the first assistant turn it is session context: present from the
+        # first request, part of the rendered prefix forever, so folding it into
+        # `system` costs nothing and is what callers expect.
+        #
+        # After the first assistant turn it is an interjection -- Claude Code appends
+        # one ("The user sent a new message while you were working: ...") when the
+        # user types mid-turn. Hoisting THAT wrecks the prompt cache: templates emit
+        # the merged system block at the very front of the render (Qwen3 puts it just
+        # after the tools array, ~23k tokens in), so a message appended at index 106
+        # lands at the FRONT of the prompt and invalidates every KV entry after it.
+        # Measured on Qwen3.8-27B at 124k context: a ~90-token append became a full
+        # 128,413-token re-prefill, 22.7 minutes of GPU time.
+        #
+        # So interjections stay in place, re-roled to `user`. They cannot stay
+        # `system`: AnthropicMessage.role is Literal["user","assistant"], and a
+        # template that accepts only leading system content raises on a later one
+        # (Qwen3: raise_exception('System message must be at the beginning.')).
+        # `user` is also the honest role -- the text is the user's own message -- and
+        # it keeps the request a pure append, so the prefix stays valid.
+        first_assistant = next(
+            (
+                index
+                for index, message in enumerate(messages)
+                if isinstance(message, dict) and message.get("role") == "assistant"
+            ),
+            len(messages),
+        )
+
+        for index, message in enumerate(messages):
             if isinstance(message, dict) and message.get("role") == "system":
                 text = _anthropic_content_to_system_text(message.get("content", ""))
-                if not _is_repeated_claude_style_reminder(text, retained_system):
-                    system_additions.append(text)
-                    retained_system.append(text)
                 changed = True
+                if index < first_assistant:
+                    if not _is_repeated_claude_style_reminder(text, retained_system):
+                        system_additions.append(text)
+                        retained_system.append(text)
+                    continue
+                # Drop empties rather than emit a contentless user turn; mirrors
+                # _merge_anthropic_system's own `if text.strip()` filter.
+                if text.strip():
+                    normalized_messages.append({"role": "user", "content": text})
                 continue
             normalized_messages.append(message)
 
@@ -3848,7 +3884,13 @@ class AnthropicMessagesRequest(BaseModel):
 
         normalized = dict(data)
         normalized["messages"] = normalized_messages
-        normalized["system"] = _merge_anthropic_system(normalized.get("system"), system_additions)
+        # Guarded: with only interjections there is nothing to merge, and an
+        # unconditional assignment would materialise system=None where the caller
+        # sent no system field at all.
+        if system_additions:
+            normalized["system"] = _merge_anthropic_system(
+                normalized.get("system"), system_additions
+            )
         return normalized
 
     @field_validator("permission_mode", mode = "before")
