@@ -3615,6 +3615,53 @@ def _anthropic_content_to_system_text(content: Any) -> str:
     return str(content)
 
 
+# Claude Code wraps a mid-turn interjection in an explanation aimed at a model
+# that receives it as ephemeral system context. Once it is re-roled to a `user`
+# turn (see normalize_system_messages) that explanation becomes a permanent
+# user-authored imperative, and the local model re-obeys it on every later turn.
+# Keep the user's sentence, drop the framing.
+_CC_INTERJECTION_HEADER = "The user sent a new message while you were working:"
+_CC_INTERJECTION_TRAILER = "This is how Claude Code surfaces messages the user sends mid-turn"
+
+# Harness reminders arrive bare on the wire -- role="system" is the ONLY signal
+# that they are machine-generated. Re-roling to `user` destroys it and the model
+# reads them as the user talking, so restore the marker Claude Code itself uses
+# for this content. They are deliberately left duplicated: a reminder repeats
+# because its condition still holds, so recurrence and position are the payload.
+_CC_REMINDER_OPEN = "<system-reminder>"
+_CC_REMINDER_CLOSE = "</system-reminder>"
+
+
+def _unwrap_claude_code_interjection(text: str) -> tuple[str, bool]:
+    """(user's own words, is_interjection).
+
+    Non-interjections are returned unchanged with False, so the caller can treat
+    harness reminders differently from things the user actually said.
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith(_CC_INTERJECTION_HEADER):
+        return text, False
+    body = stripped[len(_CC_INTERJECTION_HEADER):]
+    trailer = body.find(_CC_INTERJECTION_TRAILER)
+    if trailer != -1:
+        body = body[:trailer]
+    body = body.strip()
+    # Never return empty: an interjection that is only framing is still evidence
+    # the user spoke, so fall back to the original rather than dropping the turn.
+    return (body or text), True
+
+
+def _mark_harness_reminder(text: str) -> str:
+    """Tag machine-generated context so a `user` turn does not impersonate the user.
+
+    Idempotent, and a pure per-message transform -- it never reorders or drops a
+    message, so the request stays a pure append and the prompt cache holds.
+    """
+    if _CC_REMINDER_OPEN in text:
+        return text
+    return _CC_REMINDER_OPEN + "\n" + text.strip() + "\n" + _CC_REMINDER_CLOSE
+
+
 def _merge_anthropic_system(system: Any, additions: list[str]) -> Any:
     if not additions:
         return system
@@ -3872,10 +3919,22 @@ class AnthropicMessagesRequest(BaseModel):
                         system_additions.append(text)
                         retained_system.append(text)
                     continue
+                body, is_interjection = _unwrap_claude_code_interjection(text)
                 # Drop empties rather than emit a contentless user turn; mirrors
                 # _merge_anthropic_system's own `if text.strip()` filter.
-                if text.strip():
-                    normalized_messages.append({"role": "user", "content": text})
+                if not body.strip():
+                    continue
+                if not is_interjection:
+                    # Claude's per-tool output-style reminder is dropped once its style
+                    # is already in `system`, as upstream does before the first
+                    # assistant turn: it only restates retained text and would add one
+                    # turn per tool round. Every other reminder is kept, because it
+                    # repeats while its condition holds, so recurrence and position are
+                    # the information.
+                    if _is_repeated_claude_style_reminder(text, retained_system):
+                        continue
+                    body = _mark_harness_reminder(body)
+                normalized_messages.append({"role": "user", "content": body})
                 continue
             normalized_messages.append(message)
 
