@@ -1786,6 +1786,11 @@ _OPENAI_PASSTHROUGH_SSE_KEEPALIVE = ": keep-alive\n\n"
 # a retained last-event-id satisfies their "anything to dispatch" test; that is a
 # decoder conformance bug, it costs an ignorable event rather than data, and
 # llama-server does not send `id:`. Losing a token is the worse failure.
+# A real SSE *event*, not a comment: an Anthropic-protocol client re-arms its
+# stream-idle watchdog per parsed event, and a comment is consumed by the parser
+# without ever being yielded. Matches what the genuine Anthropic API sends during
+# a long wait. Only for /messages -- OpenAI's dialect has no ping event.
+_ANTHROPIC_SSE_PING = 'event: ping\ndata: {"type": "ping"}\n\n'
 
 
 class _LlamaStreamKeepalive:
@@ -37443,7 +37448,7 @@ async def _anthropic_tool_stream(
                         )
                         if _done_tasks:
                             break
-                        yield _OPENAI_PASSTHROUGH_SSE_KEEPALIVE
+                        yield _ANTHROPIC_SSE_PING
                     event = _next_task.result()
                     # Done; drop the reference so the finally-block drain no-ops.
                     _next_task = None
@@ -37453,7 +37458,7 @@ async def _anthropic_tool_stream(
                     if etype == "heartbeat":
                         # Tool-wrapper heartbeat -> SSE keepalive, checked BEFORE the drop skip:
                         # a dropped tool still runs and suppresses the stall keepalive.
-                        yield _OPENAI_PASSTHROUGH_SSE_KEEPALIVE
+                        yield _ANTHROPIC_SSE_PING
                         continue
                     if etype in ("tool_output", "tool_args"):
                         # No Anthropic Messages equivalent (the full call/result follow in tool_use /
@@ -37462,7 +37467,7 @@ async def _anthropic_tool_stream(
                         _now = time.monotonic()
                         if _now - _last_drop_keepalive >= _LOCAL_TOOL_STREAM_STALL_KEEPALIVE_S:
                             _last_drop_keepalive = _now
-                            yield _OPENAI_PASSTHROUGH_SSE_KEEPALIVE
+                            yield _ANTHROPIC_SSE_PING
                         continue
                     if drop_until_tool_end:
                         # disable_parallel_tool_use: skip every event until (and
@@ -37596,7 +37601,7 @@ async def _anthropic_plain_stream(
                         )
                         if _done_tasks:
                             break
-                        yield _OPENAI_PASSTHROUGH_SSE_KEEPALIVE
+                        yield _ANTHROPIC_SSE_PING
                     cumulative = _next_task.result()
                     # Done; drop the reference so the finally-block drain no-ops.
                     _next_task = None
@@ -38581,7 +38586,7 @@ async def _anthropic_passthrough_stream(
             )
             async for raw_line in items_iter:
                 if raw_line is _LLAMA_STREAM_KEEPALIVE:
-                    yield _OPENAI_PASSTHROUGH_SSE_KEEPALIVE
+                    yield _ANTHROPIC_SSE_PING
                     continue
                 if not raw_line or not raw_line.startswith("data: "):
                     continue
